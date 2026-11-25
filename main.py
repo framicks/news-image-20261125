@@ -1,63 +1,128 @@
 #!/usr/bin/env python3
-"""Publish the 25 November 2026 front page as the competition entry.
+"""Salin front-page.png ke direktori output dengan verifikasi byte-identik.
 
-The newspaper image ships in this repository as ``front-page.png``.
-This program draws nothing and reaches for no network: it checks
-that the shipped file really is a 1024x1024 PNG and then writes an
-exact copy to ``$MAKEFUN_OUTPUT_DIR/entry.png`` (``/output`` when
-the variable is unset). Because the image is only ever copied,
-repeated runs agree byte for byte.
+Program ini tidak menggambar apa pun dan tidak memakai network.
+Tugasnya hanya: pastikan gambar yang dikirim bersama program adalah PNG
+1024x1024 yang utuh, lalu salin persis apa adanya ke
+$MAKEFUN_OUTPUT_DIR/entry.png dan buktikan salinannya identik.
 """
 
 import hashlib
 import os
 import struct
 import sys
-from pathlib import Path
 
+# Delapan byte pertama setiap file PNG yang sah.
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
-WANT_WIDTH = 1024
-WANT_HEIGHT = 1024
-SHIPPED = "front-page.png"
-TARGET = "entry.png"
+
+# Ukuran kanvas yang diminta bounty.
+CANVAS_WIDTH = 1024
+CANVAS_HEIGHT = 1024
+
+SOURCE_NAME = "front-page.png"
+TARGET_NAME = "entry.png"
 
 
-def die(message):
-    print(f"main.py: {message}", file=sys.stderr)
-    raise SystemExit(1)
+def abort(message):
+    """Cetak keluhan ke stderr lalu berhenti dengan kode gagal."""
+    print("error: " + message, file=sys.stderr)
+    sys.exit(1)
 
 
-def load_shipped():
-    here = Path(__file__).resolve().parent
-    path = here / SHIPPED
-    if not path.is_file():
-        die(f"missing {SHIPPED} next to {Path(__file__).name}")
-    return path.read_bytes()
+def locate_source():
+    """Kembalikan path absolut front-page.png di sebelah script ini."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, SOURCE_NAME)
 
 
-def check_png(blob):
-    if blob[:8] != PNG_MAGIC:
-        die("front-page.png does not start with the PNG signature")
-    if len(blob) < 33 or blob[12:16] != b"IHDR":
-        die("front-page.png has no IHDR chunk where one is expected")
-    width, height = struct.unpack(">II", blob[16:24])
-    if (width, height) != (WANT_WIDTH, WANT_HEIGHT):
-        die(f"front-page.png is {width}x{height}, expected 1024x1024")
+def read_png_size(blob):
+    """Ambil (lebar, tinggi) dari chunk IHDR sebuah blob PNG.
+
+    Chunk pertama setelah signature harus IHDR; 8 byte pertama datanya
+    adalah lebar dan tinggi sebagai unsigned int big-endian.
+    """
+    offset = len(PNG_MAGIC)
+    while offset + 8 <= len(blob):
+        chunk_len = struct.unpack(">I", blob[offset:offset + 4])[0]
+        chunk_type = blob[offset + 4:offset + 8]
+        if chunk_type == b"IHDR":
+            if chunk_len < 8:
+                abort("chunk IHDR terlalu pendek")
+            width, height = struct.unpack(">II", blob[offset + 8:offset + 16])
+            return width, height
+        # Lewati data chunk ini + 4 byte CRC; tolak bila melewati ujung file.
+        if offset + 12 + chunk_len > len(blob):
+            abort("chunk PNG terpotong di tengah jalan")
+        offset += 12 + chunk_len
+    abort("chunk IHDR tidak ditemukan")
+
+
+def verify_complete(blob):
+    """Pastikan file diakhiri chunk IEND (12 byte terakhir).
+
+    File PNG yang terpotong saat diunduh/disalin biasanya kehilangan
+    ekor ini, jadi ini penanda sederhana bahwa file utuh.
+    """
+    tail = blob[-12:]
+    if len(tail) < 12:
+        abort("file PNG terlalu pendek untuk memuat chunk IEND")
+    tail_len, tail_type = struct.unpack(">I4s", tail[:8])
+    if tail_len != 0 or tail_type != b"IEND":
+        abort("file PNG tidak diakhiri chunk IEND (kemungkinan terpotong)")
+
+
+def fingerprint(blob):
+    """Kembalikan hex sha256 dari blob bytes."""
+    return hashlib.sha256(blob).hexdigest()
+
+
+def resolve_output_dir():
+    """Direktori output dari env, default /output; pastikan ada."""
+    chosen = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+    os.makedirs(chosen, exist_ok=True)
+    return chosen
 
 
 def main():
-    blob = load_shipped()
-    check_png(blob)
-    out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    target = out_dir / TARGET
-    target.write_bytes(blob)
-    digest = hashlib.sha256(blob).hexdigest()
-    # Re-read what landed on disk so a short write can never pass
-    # silently: the entry must be the shipped image, byte for byte.
-    if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
-        die(f"{target} does not match the shipped image after writing")
-    print(f"wrote {target} ({len(blob)} bytes, sha256 {digest})")
+    source_path = locate_source()
+
+    try:
+        with open(source_path, "rb") as handle:
+            original = handle.read()
+    except OSError as exc:
+        abort("tidak bisa membaca %s: %s" % (source_path, exc))
+
+    if len(original) < len(PNG_MAGIC) or original[:8] != PNG_MAGIC:
+        abort("%s bukan file PNG (signature tidak cocok)" % SOURCE_NAME)
+
+    width, height = read_png_size(original)
+    verify_complete(original)
+    if (width, height) != (CANVAS_WIDTH, CANVAS_HEIGHT):
+        abort(
+            "%s berukuran %dx%d, harus %dx%d"
+            % (SOURCE_NAME, width, height, CANVAS_WIDTH, CANVAS_HEIGHT)
+        )
+
+    target_path = os.path.join(resolve_output_dir(), TARGET_NAME)
+    try:
+        with open(target_path, "wb") as handle:
+            handle.write(original)
+    except OSError as exc:
+        abort("tidak bisa menulis %s: %s" % (target_path, exc))
+
+    try:
+        with open(target_path, "rb") as handle:
+            copied = handle.read()
+    except OSError as exc:
+        abort("tidak bisa membaca kembali %s: %s" % (target_path, exc))
+
+    if fingerprint(copied) != fingerprint(original):
+        abort("salinan %s tidak identik dengan sumber" % TARGET_NAME)
+
+    print(
+        "ok: entry.png %d byte, sha256 %s"
+        % (len(copied), fingerprint(copied))
+    )
 
 
 if __name__ == "__main__":
